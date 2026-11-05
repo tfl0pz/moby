@@ -2,36 +2,50 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	contentlocal "github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	contentlocal "github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/gofrs/flock"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/ociindex"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	sessioncontent "github.com/moby/buildkit/session/content"
 	"github.com/moby/buildkit/session/filesync"
 	"github.com/moby/buildkit/session/grpchijack"
 	"github.com/moby/buildkit/solver/pb"
-	"github.com/moby/buildkit/util/entitlements"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	opentracing "github.com/opentracing/opentracing-go"
+	spb "github.com/moby/buildkit/sourcepolicy/pb"
+	"github.com/moby/buildkit/util/bklog"
+	digest "github.com/opencontainers/go-digest"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"github.com/tonistiigi/fsutil"
 	fstypes "github.com/tonistiigi/fsutil/types"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 )
 
 type SolveOpt struct {
 	Exports               []ExportEntry
-	LocalDirs             map[string]string
+	CompatibilityVersion  int
+	EnableSessionExporter bool
+	LocalMounts           map[string]fsutil.FS
+	LocalFilterOpt        filesync.FilterOptFunc
+	OCIStores             map[string]content.Store
 	SharedKey             string
 	Frontend              string
 	FrontendAttrs         map[string]string
@@ -39,16 +53,22 @@ type SolveOpt struct {
 	CacheExports          []CacheOptionsEntry
 	CacheImports          []CacheOptionsEntry
 	Session               []session.Attachable
-	AllowedEntitlements   []entitlements.Entitlement
+	AllowedEntitlements   []string
 	SharedSession         *session.Session // TODO: refactor to better session syncing
 	SessionPreInitialized bool             // TODO: refactor to better session syncing
+	Internal              bool
+	SourcePolicy          *spb.Policy
+	SourcePolicyProvider  session.Attachable
+	ProxyNetwork          bool
+	Ref                   string
 }
 
 type ExportEntry struct {
-	Type      string
-	Attrs     map[string]string
-	Output    func(map[string]string) (io.WriteCloser, error) // for ExporterOCI and ExporterDocker
-	OutputDir string                                          // for ExporterLocal
+	Type        string
+	Attrs       map[string]string
+	Output      filesync.FileOutputFunc // for ExporterOCI and ExporterDocker
+	OutputDir   string                  // for ExporterLocal
+	OutputStore content.Store
 }
 
 type CacheOptionsEntry struct {
@@ -75,114 +95,213 @@ func (c *Client) Solve(ctx context.Context, def *llb.Definition, opt SolveOpt, s
 	return c.solve(ctx, def, nil, opt, statusChan)
 }
 
-type runGatewayCB func(ref string, s *session.Session) error
+type runGatewayCB func(ref string, s *session.Session, opts map[string]string) error
 
 func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runGatewayCB, opt SolveOpt, statusChan chan *SolveStatus) (*SolveResponse, error) {
 	if def != nil && runGateway != nil {
 		return nil, errors.New("invalid with def and cb")
 	}
 
-	syncedDirs, err := prepareSyncedDirs(def, opt.LocalDirs)
+	syncedDirs, err := prepareSyncedFiles(def, opt.LocalMounts)
 	if err != nil {
 		return nil, err
 	}
 
 	ref := identity.NewID()
+	if opt.Ref != "" {
+		ref = opt.Ref
+	}
+
+	callerCtx := ctx
 	eg, ctx := errgroup.WithContext(ctx)
 
-	statusContext, cancelStatus := context.WithCancel(context.Background())
-	defer cancelStatus()
+	statusContext, cancelStatus := context.WithCancelCause(context.Background())
+	defer cancelStatus(errors.WithStack(context.Canceled))
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		statusContext = opentracing.ContextWithSpan(statusContext, span)
+	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
+		statusContext = trace.ContextWithSpan(statusContext, span)
 	}
 
 	s := opt.SharedSession
 
 	if s == nil {
 		if opt.SessionPreInitialized {
-			return nil, errors.Errorf("no session provided for preinitialized option")
+			return nil, errors.New("no session provided for preinitialized option")
 		}
-		s, err = session.NewSession(statusContext, defaultSessionName(), opt.SharedKey)
+		s, err = session.NewSession(statusContext, opt.SharedKey)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create session")
 		}
 	}
 
-	cacheOpt, err := parseCacheOptions(opt)
+	cacheOpt, err := parseCacheOptions(ctx, runGateway != nil, opt)
 	if err != nil {
 		return nil, err
 	}
 
-	var ex ExportEntry
-	if len(opt.Exports) > 1 {
-		return nil, errors.New("currently only single Exports can be specified")
+	cacheStores := make(map[string]*cacheExportStore)
+	for storePath := range cacheOpt.storesToUpdate {
+		key := "local:" + storePath
+		store := &cacheExportStore{
+			Store: cacheOpt.contentStores[key],
+			lock:  flock.New(filepath.Join(storePath, "cache.lock")),
+		}
+		// Defer until solve returns: export locks must outlive index publication,
+		// and also be released on error. Closing again after explicit cleanup is safe.
+		defer store.Close()
+		cacheOpt.contentStores[key] = store
+		cacheStores[storePath] = store
 	}
-	if len(opt.Exports) == 1 {
-		ex = opt.Exports[0]
-	}
+
+	storesToUpdate := []string{}
 
 	if !opt.SessionPreInitialized {
 		if len(syncedDirs) > 0 {
-			s.Allow(filesync.NewFSSyncProvider(syncedDirs))
+			s.Allow(filesync.NewFSSyncProvider(syncedDirs, opt.LocalFilterOpt))
 		}
 
 		for _, a := range opt.Session {
 			s.Allow(a)
 		}
 
-		switch ex.Type {
-		case ExporterLocal:
-			if ex.Output != nil {
-				return nil, errors.New("output file writer is not supported by local exporter")
+		contentStores := map[string]content.Store{}
+		maps.Copy(contentStores, cacheOpt.contentStores)
+		for key, store := range opt.OCIStores {
+			key2 := "oci:" + key
+			if _, ok := contentStores[key2]; ok {
+				return nil, errors.Errorf("oci store key %q already exists", key)
 			}
-			if ex.OutputDir == "" {
-				return nil, errors.New("output directory is required for local exporter")
+			contentStores[key2] = store
+		}
+
+		var syncTargets []filesync.FSSyncTarget
+		for exID, ex := range opt.Exports {
+			var supportFile, supportDir, supportStore bool
+			switch ex.Type {
+			case ExporterLocal:
+				supportDir = true
+			case ExporterTar:
+				supportFile = true
+			case ExporterOCI, ExporterDocker:
+				supportFile = ex.Output != nil
+				supportStore = ex.OutputStore != nil || ex.OutputDir != ""
+				if supportFile && supportStore {
+					return nil, errors.Errorf("both file and store output is not supported by %s exporter", ex.Type)
+				}
 			}
-			s.Allow(filesync.NewFSSyncTargetDir(ex.OutputDir))
-		case ExporterOCI, ExporterDocker, ExporterTar:
-			if ex.OutputDir != "" {
-				return nil, errors.Errorf("output directory %s is not supported by %s exporter", ex.OutputDir, ex.Type)
-			}
-			if ex.Output == nil {
-				return nil, errors.Errorf("output file writer is required for %s exporter", ex.Type)
-			}
-			s.Allow(filesync.NewFSSyncTarget(ex.Output))
-		default:
-			if ex.Output != nil {
+			if !supportFile && ex.Output != nil {
 				return nil, errors.Errorf("output file writer is not supported by %s exporter", ex.Type)
 			}
-			if ex.OutputDir != "" {
-				return nil, errors.Errorf("output directory %s is not supported by %s exporter", ex.OutputDir, ex.Type)
+			if !supportDir && !supportStore && ex.OutputDir != "" {
+				return nil, errors.Errorf("output directory is not supported by %s exporter", ex.Type)
+			}
+			if !supportStore && ex.OutputStore != nil {
+				return nil, errors.Errorf("output store is not supported by %s exporter", ex.Type)
+			}
+			if supportFile {
+				if ex.Output == nil {
+					return nil, errors.Errorf("output file writer is required for %s exporter", ex.Type)
+				}
+				syncTargets = append(syncTargets, filesync.WithFSSync(exID, ex.Output))
+			}
+			if supportDir {
+				if ex.OutputDir == "" {
+					return nil, errors.Errorf("output directory is required for %s exporter", ex.Type)
+				}
+				if ex.Type == ExporterLocal {
+					mode := LocalExporterModeCopy
+					if ex.Attrs != nil {
+						mode, err = ParseLocalExporterMode(ex.Attrs["mode"])
+						if err != nil {
+							return nil, err
+						}
+					}
+					if mode == LocalExporterModeDelete {
+						syncTargets = append(syncTargets, filesync.WithFSSyncDirDelete(exID, ex.OutputDir))
+					} else {
+						syncTargets = append(syncTargets, filesync.WithFSSyncDir(exID, ex.OutputDir))
+					}
+				} else {
+					syncTargets = append(syncTargets, filesync.WithFSSyncDir(exID, ex.OutputDir))
+				}
+			}
+			if supportStore {
+				store := ex.OutputStore
+				if store == nil {
+					if err := os.MkdirAll(ex.OutputDir, 0755); err != nil {
+						return nil, err
+					}
+					store, err = contentlocal.NewStore(ex.OutputDir)
+					if err != nil {
+						return nil, err
+					}
+					storesToUpdate = append(storesToUpdate, ex.OutputDir)
+				}
+
+				// TODO: this should be dependent on the exporter id (to allow multiple oci exporters)
+				storeName := "export"
+				if _, ok := contentStores[storeName]; ok {
+					return nil, errors.Errorf("oci store key %q already exists", storeName)
+				}
+				contentStores[storeName] = store
 			}
 		}
 
-		if len(cacheOpt.contentStores) > 0 {
-			s.Allow(sessioncontent.NewAttachable(cacheOpt.contentStores))
+		if len(contentStores) > 0 {
+			s.Allow(sessioncontent.NewAttachable(contentStores))
+		}
+
+		if len(syncTargets) > 0 {
+			s.Allow(filesync.NewFSSyncTarget(syncTargets...))
+		}
+
+		if opt.SourcePolicyProvider != nil {
+			s.Allow(opt.SourcePolicyProvider)
 		}
 
 		eg.Go(func() error {
-			return s.Run(statusContext, grpchijack.Dialer(c.controlClient()))
+			sd := c.sessionDialer
+			if sd == nil {
+				sd = grpchijack.Dialer(c.ControlClient())
+			}
+			return s.Run(statusContext, sd)
 		})
 	}
 
-	for k, v := range cacheOpt.frontendAttrs {
-		opt.FrontendAttrs[k] = v
-	}
+	frontendAttrs := maps.Clone(opt.FrontendAttrs)
+	maps.Copy(frontendAttrs, cacheOpt.frontendAttrs)
 
-	solveCtx, cancelSolve := context.WithCancel(ctx)
+	const statusInactivityTimeout = 5 * time.Second
+	statusActivity := make(chan struct{}, 1)
+
+	solveCtx, cancelSolve := context.WithCancelCause(ctx)
 	var res *SolveResponse
 	eg.Go(func() error {
 		ctx := solveCtx
-		defer cancelSolve()
+		defer cancelSolve(errors.WithStack(context.Canceled))
 
 		defer func() { // make sure the Status ends cleanly on build errors
 			go func() {
-				<-time.After(3 * time.Second)
-				cancelStatus()
+				// Start inactivity monitoring after solve completes
+				statusInactivityTimer := time.NewTimer(statusInactivityTimeout)
+				defer statusInactivityTimer.Stop()
+				for {
+					select {
+					case <-statusContext.Done():
+						return
+					case <-statusActivity:
+						// Reset timer on activity
+						statusInactivityTimer.Reset(statusInactivityTimeout)
+					case <-statusInactivityTimer.C:
+						cancelStatus(errors.WithStack(context.Canceled))
+						return
+					}
+				}
 			}()
-			logrus.Debugf("stopping session")
-			s.Close()
+			if !opt.SessionPreInitialized {
+				bklog.G(ctx).Debugf("stopping session")
+				s.Close()
+			}
 		}()
 		var pbd *pb.Definition
 		if def != nil {
@@ -198,18 +317,43 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			frontendInputs[key] = def.ToPB()
 		}
 
-		resp, err := c.controlClient().Solve(ctx, &controlapi.SolveRequest{
-			Ref:            ref,
-			Definition:     pbd,
-			Exporter:       ex.Type,
-			ExporterAttrs:  ex.Attrs,
-			Session:        s.ID(),
-			Frontend:       opt.Frontend,
-			FrontendAttrs:  opt.FrontendAttrs,
-			FrontendInputs: frontendInputs,
-			Cache:          cacheOpt.options,
-			Entitlements:   opt.AllowedEntitlements,
-		})
+		exports := make([]*controlapi.Exporter, 0, len(opt.Exports))
+		exportDeprecated := ""
+		exportAttrDeprecated := map[string]string{}
+		for i, exp := range opt.Exports {
+			if i == 0 {
+				exportDeprecated = exp.Type
+				exportAttrDeprecated = exp.Attrs
+			}
+			exports = append(exports, &controlapi.Exporter{
+				Type:  exp.Type,
+				Attrs: exp.Attrs,
+			})
+		}
+
+		sopt := &controlapi.SolveRequest{
+			Ref:                     ref,
+			Definition:              pbd,
+			Exporters:               exports,
+			ExporterDeprecated:      exportDeprecated,
+			ExporterAttrsDeprecated: exportAttrDeprecated,
+			EnableSessionExporter:   opt.EnableSessionExporter,
+			Session:                 s.ID(),
+			Frontend:                opt.Frontend,
+			FrontendAttrs:           frontendAttrs,
+			FrontendInputs:          frontendInputs,
+			Cache:                   &cacheOpt.options,
+			Entitlements:            slices.Clone(opt.AllowedEntitlements),
+			Internal:                opt.Internal,
+			CompatibilityVersion:    int64(opt.CompatibilityVersion),
+			SourcePolicy:            opt.SourcePolicy,
+			ProxyNetwork:            opt.ProxyNetwork,
+		}
+		if opt.SourcePolicyProvider != nil {
+			sopt.SourcePolicySession = s.ID()
+		}
+
+		resp, err := c.ControlClient().Solve(ctx, sopt)
 		if err != nil {
 			return errors.Wrap(err, "failed to solve")
 		}
@@ -221,7 +365,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 
 	if runGateway != nil {
 		eg.Go(func() error {
-			err := runGateway(ref, s)
+			err := runGateway(ref, s, frontendAttrs)
 			if err == nil {
 				return nil
 			}
@@ -234,7 +378,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			select {
 			case <-solveCtx.Done():
 			case <-time.After(5 * time.Second):
-				cancelSolve()
+				cancelSolve(errors.WithStack(context.Canceled))
 			}
 
 			return err
@@ -242,7 +386,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 	}
 
 	eg.Go(func() error {
-		stream, err := c.controlClient().Status(statusContext, &controlapi.StatusRequest{
+		stream, err := c.ControlClient().Status(statusContext, &controlapi.StatusRequest{
 			Ref: ref,
 		})
 		if err != nil {
@@ -251,45 +395,22 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		for {
 			resp, err := stream.Recv()
 			if err != nil {
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				// Ignore context canceled, triggered after inactivity timeout
+				if errors.Is(err, context.Canceled) || statusContext.Err() != nil {
 					return nil
 				}
 				return errors.Wrap(err, "failed to receive status")
 			}
-			s := SolveStatus{}
-			for _, v := range resp.Vertexes {
-				s.Vertexes = append(s.Vertexes, &Vertex{
-					Digest:    v.Digest,
-					Inputs:    v.Inputs,
-					Name:      v.Name,
-					Started:   v.Started,
-					Completed: v.Completed,
-					Error:     v.Error,
-					Cached:    v.Cached,
-				})
-			}
-			for _, v := range resp.Statuses {
-				s.Statuses = append(s.Statuses, &VertexStatus{
-					ID:        v.ID,
-					Vertex:    v.Vertex,
-					Name:      v.Name,
-					Total:     v.Total,
-					Current:   v.Current,
-					Timestamp: v.Timestamp,
-					Started:   v.Started,
-					Completed: v.Completed,
-				})
-			}
-			for _, v := range resp.Logs {
-				s.Logs = append(s.Logs, &VertexLog{
-					Vertex:    v.Vertex,
-					Stream:    int(v.Stream),
-					Data:      v.Msg,
-					Timestamp: v.Timestamp,
-				})
+			// Signal activity (non-blocking)
+			select {
+			case statusActivity <- struct{}{}:
+			default:
 			}
 			if statusChan != nil {
-				statusChan <- &s
+				statusChan <- NewSolveStatus(resp)
 			}
 		}
 	})
@@ -300,88 +421,207 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 	// Update index.json of exported cache content store
 	// FIXME(AkihiroSuda): dedupe const definition of cache/remotecache.ExporterResponseManifestDesc = "cache.manifest"
 	if manifestDescJSON := res.ExporterResponse["cache.manifest"]; manifestDescJSON != "" {
-		var manifestDesc ocispec.Descriptor
+		var manifestDesc ocispecs.Descriptor
 		if err = json.Unmarshal([]byte(manifestDescJSON), &manifestDesc); err != nil {
 			return nil, err
 		}
-		for indexJSONPath, tag := range cacheOpt.indicesToUpdate {
-			if err = ociindex.PutDescToIndexJSONFileLocked(indexJSONPath, manifestDesc, tag); err != nil {
+		for storePath, tag := range cacheOpt.storesToUpdate {
+			idx := ociindex.NewStoreIndex(storePath)
+			if err := idx.Put(manifestDesc, ociindex.Tag(tag)); err != nil {
 				return nil, err
 			}
+		}
+	}
+	if manifestDescDt := res.ExporterResponse[exptypes.ExporterImageDescriptorKey]; manifestDescDt != "" {
+		manifestDescDt, err := base64.StdEncoding.DecodeString(manifestDescDt)
+		if err != nil {
+			return nil, err
+		}
+		var manifestDesc ocispecs.Descriptor
+		if err = json.Unmarshal(manifestDescDt, &manifestDesc); err != nil {
+			return nil, err
+		}
+		for _, storePath := range storesToUpdate {
+			names := []ociindex.NameOrTag{ociindex.Tag("latest")}
+			if t, ok := res.ExporterResponse[exptypes.ExporterImageNameKey]; ok {
+				inp := strings.Split(t, ",")
+				names = make([]ociindex.NameOrTag, len(inp))
+				for i, n := range inp {
+					names[i] = ociindex.Name(n)
+				}
+			}
+			idx := ociindex.NewStoreIndex(storePath)
+			if err := idx.Put(manifestDesc, names...); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// Release all export locks before attempting an exclusive reset lock.
+	for _, store := range cacheStores {
+		if err := store.Close(); err != nil {
+			bklog.G(callerCtx).WithError(err).WithField("cache_store_path", filepath.Dir(store.lock.Path())).Warn("failed to unlock cache store")
+		}
+	}
+	// Reset cache stores that have reset=true — delete unreferenced blobs
+	for _, ref := range cacheOpt.storesToReset {
+		if err := resetCacheStore(callerCtx, ref.store, ref.path, cacheStores[ref.path].lock); err != nil {
+			bklog.G(callerCtx).WithError(err).WithField("cache_store_path", ref.path).Warn("failed to reset cache store")
 		}
 	}
 	return res, nil
 }
 
-func prepareSyncedDirs(def *llb.Definition, localDirs map[string]string) ([]filesync.SyncedDir, error) {
-	for _, d := range localDirs {
-		fi, err := os.Stat(d)
+// cacheExportStore protects blobs from reset starting at the first write attempt,
+// including attempts that reuse existing blobs. The caller releases the lock only
+// after publishing the export in index.json, or when the solve fails.
+type cacheExportStore struct {
+	content.Store
+	mu     sync.RWMutex
+	lock   *flock.Flock
+	closed bool
+}
+
+func (s *cacheExportStore) Writer(ctx context.Context, opts ...content.WriterOpt) (content.Writer, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, errors.WithStack(os.ErrClosed)
+	}
+	if !s.lock.RLocked() {
+		_, err := s.lock.TryRLockContext(ctx, 100*time.Millisecond)
 		if err != nil {
-			return nil, errors.Wrapf(err, "could not find %s", d)
-		}
-		if !fi.IsDir() {
-			return nil, errors.Errorf("%s not a directory", d)
+			return nil, errors.Wrap(err, "failed to lock cache store for export")
 		}
 	}
-	resetUIDAndGID := func(p string, st *fstypes.Stat) bool {
-		st.Uid = 0
-		st.Gid = 0
-		return true
+	return s.Store.Writer(ctx, opts...)
+}
+
+// Close is called after session requests have finished or been canceled. Prevent
+// late handlers from reacquiring the lock after the solve has returned.
+func (s *cacheExportStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return s.lock.Close()
+}
+
+// resetCacheStore deletes all blobs not referenced by any manifest in
+// index.json. Referenced blobs are always preserved.
+func resetCacheStore(ctx context.Context, cs content.Store, storePath string, lock *flock.Flock) error {
+	// Keep the lock file: unlinking it could allow another process to lock a
+	// different inode while an exporter is still using the original one.
+	defer lock.Close()
+	locked, err := lock.TryLock()
+	if err != nil {
+		return errors.Wrap(err, "reset: failed to lock cache store")
+	}
+	if !locked {
+		return errors.New("reset: cache store is in use, skipping cleanup")
 	}
 
-	dirs := make([]filesync.SyncedDir, 0, len(localDirs))
+	idx := ociindex.NewStoreIndex(storePath)
+	index, err := idx.Read()
+	if err != nil {
+		return errors.Wrap(err, "reset: failed to read index.json")
+	}
+
+	var mu sync.Mutex
+	referenced := make(map[digest.Digest]struct{})
+	childrenHandler := images.ChildrenHandler(cs)
+	handler := images.HandlerFunc(func(ctx context.Context, desc ocispecs.Descriptor) ([]ocispecs.Descriptor, error) {
+		mu.Lock()
+		referenced[desc.Digest] = struct{}{}
+		mu.Unlock()
+		return childrenHandler(ctx, desc)
+	})
+	if err := images.Dispatch(ctx, handler, nil, index.Manifests...); err != nil {
+		return errors.Wrap(err, "reset: failed to collect referenced blobs")
+	}
+
+	var toDelete []digest.Digest
+	if err := cs.Walk(ctx, func(info content.Info) error {
+		if _, ok := referenced[info.Digest]; !ok {
+			toDelete = append(toDelete, info.Digest)
+		}
+		return nil
+	}); err != nil {
+		return errors.Wrap(err, "reset: failed to walk content store")
+	}
+
+	for _, dgst := range toDelete {
+		if err := cs.Delete(ctx, dgst); err != nil {
+			bklog.G(ctx).WithError(err).Warnf("reset: failed to delete blob %s", dgst)
+		}
+	}
+	return nil
+}
+
+func prepareSyncedFiles(def *llb.Definition, localMounts map[string]fsutil.FS) (filesync.StaticDirSource, error) {
+	resetUIDAndGID := func(p string, st *fstypes.Stat) fsutil.MapResult {
+		st.Uid = 0
+		st.Gid = 0
+		return fsutil.MapResultKeep
+	}
+
+	result := make(filesync.StaticDirSource, len(localMounts))
 	if def == nil {
-		for name, d := range localDirs {
-			dirs = append(dirs, filesync.SyncedDir{Name: name, Dir: d, Map: resetUIDAndGID})
+		for name, mount := range localMounts {
+			mount, err := fsutil.NewFilterFS(mount, &fsutil.FilterOpt{
+				Map: resetUIDAndGID,
+			})
+			if err != nil {
+				return nil, err
+			}
+			result[name] = mount
 		}
 	} else {
 		for _, dt := range def.Def {
 			var op pb.Op
-			if err := (&op).Unmarshal(dt); err != nil {
+			if err := op.UnmarshalVT(dt); err != nil {
 				return nil, errors.Wrap(err, "failed to parse llb proto op")
 			}
 			if src := op.GetSource(); src != nil {
-				if strings.HasPrefix(src.Identifier, "local://") { // TODO: just make a type property
-					name := strings.TrimPrefix(src.Identifier, "local://")
-					d, ok := localDirs[name]
+				if name, ok := strings.CutPrefix(src.Identifier, "local://"); ok {
+					mount, ok := localMounts[name]
 					if !ok {
 						return nil, errors.Errorf("local directory %s not enabled", name)
 					}
-					dirs = append(dirs, filesync.SyncedDir{Name: name, Dir: d, Map: resetUIDAndGID}) // TODO: excludes
+					mount, err := fsutil.NewFilterFS(mount, &fsutil.FilterOpt{
+						Map: resetUIDAndGID,
+					})
+					if err != nil {
+						return nil, err
+					}
+					result[name] = mount
 				}
 			}
 		}
 	}
-	return dirs, nil
+	return result, nil
 }
 
-func defaultSessionName() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "unknown"
-	}
-	return filepath.Base(wd)
+type cacheStoreRef struct {
+	path  string
+	store content.Store
 }
 
 type cacheOptions struct {
-	options         controlapi.CacheOptions
-	contentStores   map[string]content.Store // key: ID of content store ("local:" + csDir)
-	indicesToUpdate map[string]string        // key: index.JSON file name, value: tag
-	frontendAttrs   map[string]string
+	options        controlapi.CacheOptions
+	contentStores  map[string]content.Store // key: ID of content store ("local:" + csDir)
+	storesToUpdate map[string]string        // key: path to content store, value: tag
+	storesToReset  []cacheStoreRef          // cache stores with reset=true
+	frontendAttrs  map[string]string
 }
 
-func parseCacheOptions(opt SolveOpt) (*cacheOptions, error) {
+func parseCacheOptions(ctx context.Context, isGateway bool, opt SolveOpt) (*cacheOptions, error) {
 	var (
 		cacheExports []*controlapi.CacheOptionsEntry
 		cacheImports []*controlapi.CacheOptionsEntry
-		// legacy API is used for registry caches, because the daemon might not support the new API
-		legacyExportRef  string
-		legacyImportRefs []string
 	)
+	var storesToReset []cacheStoreRef
 	contentStores := make(map[string]content.Store)
-	indicesToUpdate := make(map[string]string) // key: index.JSON file name, value: tag
+	storesToUpdate := make(map[string]string)
 	frontendAttrs := make(map[string]string)
-	legacyExportAttrs := make(map[string]string)
 	for _, ex := range opt.CacheExports {
 		if ex.Type == "local" {
 			csDir := ex.Attrs["dest"]
@@ -396,26 +636,36 @@ func parseCacheOptions(opt SolveOpt) (*cacheOptions, error) {
 				return nil, err
 			}
 			contentStores["local:"+csDir] = cs
+
+			tag := "latest"
+			if t, ok := ex.Attrs["tag"]; ok {
+				tag = t
+			}
 			// TODO(AkihiroSuda): support custom index JSON path and tag
-			indexJSONPath := filepath.Join(csDir, "index.json")
-			indicesToUpdate[indexJSONPath] = "latest"
-		}
-		if ex.Type == "registry" && legacyExportRef == "" {
-			legacyExportRef = ex.Attrs["ref"]
-			for k, v := range ex.Attrs {
-				if k != "ref" {
-					legacyExportAttrs[k] = v
+			storesToUpdate[csDir] = tag
+
+			if v, ok := ex.Attrs["reset"]; ok {
+				b, err := strconv.ParseBool(v)
+				if err != nil {
+					return nil, errors.Wrapf(err, "failed to parse reset attribute")
+				}
+				if b {
+					storesToReset = append(storesToReset, cacheStoreRef{path: csDir, store: cs})
 				}
 			}
-		} else {
-			cacheExports = append(cacheExports, &controlapi.CacheOptionsEntry{
-				Type:  ex.Type,
-				Attrs: ex.Attrs,
-			})
 		}
+		if ex.Type == "registry" {
+			regRef := ex.Attrs["ref"]
+			if regRef == "" {
+				return nil, errors.New("registry cache exporter requires ref")
+			}
+		}
+		cacheExports = append(cacheExports, &controlapi.CacheOptionsEntry{
+			Type:  ex.Type,
+			Attrs: ex.Attrs,
+		})
 	}
 	for _, im := range opt.CacheImports {
-		attrs := im.Attrs
 		if im.Type == "local" {
 			csDir := im.Attrs["src"]
 			if csDir == "" {
@@ -423,45 +673,50 @@ func parseCacheOptions(opt SolveOpt) (*cacheOptions, error) {
 			}
 			cs, err := contentlocal.NewStore(csDir)
 			if err != nil {
-				logrus.Warning("local cache import at " + csDir + " not found due to err: " + err.Error())
+				bklog.G(ctx).Warning("local cache import at " + csDir + " not found due to err: " + err.Error())
 				continue
 			}
-			// if digest is not specified, load from "latest" tag
-			if attrs["digest"] == "" {
-				idx, err := ociindex.ReadIndexJSONFileLocked(filepath.Join(csDir, "index.json"))
-				if err != nil {
-					logrus.Warning("local cache import at " + csDir + " not found due to err: " + err.Error())
-					continue
+			dgst := im.Attrs["digest"]
+			// if digest is not specified, attempt to load from tag
+			if dgst == "" {
+				tag := "latest"
+				if t, ok := im.Attrs["tag"]; ok {
+					tag = t
 				}
-				for _, m := range idx.Manifests {
-					if (m.Annotations[ocispec.AnnotationRefName] == "latest" && attrs["tag"] == "") || (attrs["tag"] != "" && m.Annotations[ocispec.AnnotationRefName] == attrs["tag"]) {
-						attrs["digest"] = string(m.Digest)
-						break
-					}
-				}
-				if attrs["digest"] == "" {
+				if tag == "" {
 					return nil, errors.New("local cache importer requires either explicit digest, \"latest\" tag or custom tag on index.json")
 				}
+
+				idx := ociindex.NewStoreIndex(csDir)
+				desc, err := idx.Get(tag)
+				if err != nil {
+					bklog.G(ctx).Warning("local cache import at " + csDir + " skipped due to err: " + err.Error())
+					continue
+				}
+				if desc == nil {
+					bklog.G(ctx).Warning("local cache import at " + csDir + " skipped: no digest found for tag " + tag)
+					continue
+				}
+				im.Attrs["digest"] = desc.Digest.String()
+			}
+			if _, err := cs.Info(ctx, digest.Digest(im.Attrs["digest"])); err != nil {
+				bklog.G(ctx).Warning("local cache import at " + csDir + " skipped: digest " + im.Attrs["digest"] + " unavailable: " + err.Error())
+				continue
 			}
 			contentStores["local:"+csDir] = cs
-
 		}
 		if im.Type == "registry" {
-			legacyImportRef := attrs["ref"]
-			legacyImportRefs = append(legacyImportRefs, legacyImportRef)
-		} else {
-			cacheImports = append(cacheImports, &controlapi.CacheOptionsEntry{
-				Type:  im.Type,
-				Attrs: attrs,
-			})
+			regRef := im.Attrs["ref"]
+			if regRef == "" {
+				return nil, errors.New("registry cache importer requires ref")
+			}
 		}
+		cacheImports = append(cacheImports, &controlapi.CacheOptionsEntry{
+			Type:  im.Type,
+			Attrs: im.Attrs,
+		})
 	}
-	if opt.Frontend != "" {
-		// use legacy API for registry importers, because the frontend might not support the new API
-		if len(legacyImportRefs) > 0 {
-			frontendAttrs["cache-from"] = strings.Join(legacyImportRefs, ",")
-		}
-		// use new API for other importers
+	if opt.Frontend != "" || isGateway {
 		if len(cacheImports) > 0 {
 			s, err := json.Marshal(cacheImports)
 			if err != nil {
@@ -472,17 +727,13 @@ func parseCacheOptions(opt SolveOpt) (*cacheOptions, error) {
 	}
 	res := cacheOptions{
 		options: controlapi.CacheOptions{
-			// old API (for registry caches, planned to be removed in early 2019)
-			ExportRefDeprecated:   legacyExportRef,
-			ExportAttrsDeprecated: legacyExportAttrs,
-			ImportRefsDeprecated:  legacyImportRefs,
-			// new API
 			Exports: cacheExports,
 			Imports: cacheImports,
 		},
-		contentStores:   contentStores,
-		indicesToUpdate: indicesToUpdate,
-		frontendAttrs:   frontendAttrs,
+		contentStores:  contentStores,
+		storesToUpdate: storesToUpdate,
+		storesToReset:  storesToReset,
+		frontendAttrs:  frontendAttrs,
 	}
 	return &res, nil
 }
